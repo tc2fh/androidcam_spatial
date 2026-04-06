@@ -24,4 +24,5 @@ object SXTags {
     const val VIDEO = "VIDEO"
     const val LIFECYCLE = "LIFECYCLE"
     const val HUD = "HUD"
+    const val AR = "AR"
 }
