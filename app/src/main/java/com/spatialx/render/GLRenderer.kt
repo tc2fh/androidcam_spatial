@@ -53,7 +53,7 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private val identityMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
     // --- Cube (AR mode) ---
-    private lateinit var cubeRenderer: CubeRenderer
+    private var cubeRenderer: CubeRenderer? = null
     private var cubeModelMatrix: FloatArray? = null
     private val viewMatrix = FloatArray(16)
     private val projMatrix = FloatArray(16)
@@ -103,12 +103,12 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         if (mode == Mode.AR) {
             // VIEW_NORMALIZED coords for the four quad corners (matches quadTexCoords layout)
             screenTexCoords = allocFloatBuffer(texCoords)
-            arTransformedTexCoords = ByteBuffer.allocateDirect(8 * 4)
-                .order(ByteOrder.nativeOrder()).asFloatBuffer()
-        }
+            // Initialize with same coords as fallback in case first frame misses geometry change
+            arTransformedTexCoords = allocFloatBuffer(texCoords)
 
-        cubeRenderer = CubeRenderer(context)
-        cubeRenderer.init()
+            cubeRenderer = CubeRenderer(context)
+            cubeRenderer.init()
+        }
 
         fpsStartTimeNs = System.nanoTime()
         SXLog.i(SXTags.RENDER, "GL surface created, mode=$mode, texture=$cameraTextureId")
@@ -196,7 +196,7 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             if (cubeModelMatrix == null) placeCubeAhead(camera.displayOrientedPose)
             Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
             Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, cubeModelMatrix!!, 0)
-            cubeRenderer.draw(mvpMatrix)
+            cubeRenderer?.draw(mvpMatrix)
         }
 
         planeCount = session.getAllTrackables(Plane::class.java)
@@ -263,7 +263,7 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun release() {
         surfaceTexture?.release()
         surfaceTexture = null
-        cubeRenderer.release()
+        cubeRenderer?.release()
         if (bgProgram != 0) { GLES30.glDeleteProgram(bgProgram); bgProgram = 0 }
         if (cameraTextureId != 0) { GLES30.glDeleteTextures(1, intArrayOf(cameraTextureId), 0); cameraTextureId = 0 }
         SXLog.i(SXTags.RENDER, "GLRenderer released")
