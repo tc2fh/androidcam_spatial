@@ -12,7 +12,8 @@ import com.spatialx.util.SXLog
 import com.spatialx.util.SXTags
 
 /**
- * Debug HUD overlay that displays FPS, frame time, and source info.
+ * Debug HUD overlay that displays FPS, frame time, source info,
+ * tracking state, and plane count.
  * Rendered as an Android View on top of the GLSurfaceView.
  * Updates at ~2 Hz to avoid layout jank.
  */
@@ -21,13 +22,10 @@ class OverlayUI(context: Context) : TextView(context) {
     private val handler = Handler(Looper.getMainLooper())
     private var updateRunnable: Runnable? = null
 
-    /** Provider for current FPS value. */
     var fpsProvider: (() -> Float)? = null
-
-    /** Provider for last frame render time in ms. */
     var frameTimeProvider: (() -> Long)? = null
-
-    /** Label for the active input source. */
+    var trackingStateProvider: (() -> String)? = null
+    var planeCountProvider: (() -> Int)? = null
     var sourceLabel: String = "none"
 
     init {
@@ -48,20 +46,33 @@ class OverlayUI(context: Context) : TextView(context) {
         SXLog.d(SXTags.HUD, "OverlayUI created")
     }
 
-    /** Start periodic HUD updates (~2 Hz). */
     fun startUpdating() {
         updateRunnable = object : Runnable {
             override fun run() {
                 val fps = fpsProvider?.invoke() ?: 0f
                 val frameTimeMs = frameTimeProvider?.invoke() ?: 0L
-                text = "SpatialX M0\nSrc: $sourceLabel\nFPS: %.1f\nFrame: %d ms".format(fps, frameTimeMs)
+                val trackState = trackingStateProvider?.invoke()
+                val planes = planeCountProvider?.invoke()
+
+                val sb = StringBuilder()
+                sb.append("SpatialX M1\n")
+                sb.append("Src: $sourceLabel\n")
+                sb.append("FPS: %.1f\n".format(fps))
+                sb.append("Frame: %d ms".format(frameTimeMs))
+                if (trackState != null) {
+                    sb.append("\nTrack: $trackState")
+                }
+                if (planes != null) {
+                    sb.append("\nPlanes: $planes")
+                }
+                text = sb.toString()
+
                 handler.postDelayed(this, 500)
             }
         }
         handler.post(updateRunnable!!)
     }
 
-    /** Stop periodic HUD updates. */
     fun stopUpdating() {
         updateRunnable?.let { handler.removeCallbacks(it) }
         updateRunnable = null
