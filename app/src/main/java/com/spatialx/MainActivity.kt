@@ -9,37 +9,48 @@ import android.widget.FrameLayout
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.spatialx.camera.PhoneCameraSource
+import com.spatialx.ar.ARSessionManager
+import com.spatialx.camera.VideoFileSource
 import com.spatialx.render.GLRenderer
 import com.spatialx.ui.OverlayUI
 import com.spatialx.util.SXLog
 import com.spatialx.util.SXTags
 
-/**
- * Main activity for SpatialX Milestone 0.
- *
- * Wires together GLSurfaceView + GLRenderer + PhoneCameraSource + OverlayUI.
- * Manages camera permissions and lifecycle (pause/resume without leaks).
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var glSurfaceView: GLSurfaceView
     private lateinit var renderer: GLRenderer
-    private lateinit var cameraSource: PhoneCameraSource
     private lateinit var overlayUI: OverlayUI
 
-companion object {
+    private var arSessionManager: ARSessionManager? = null
+    private var videoSource: VideoFileSource? = null
+    private var videoPath: String? = null
+
+    companion object {
         private const val CAMERA_PERMISSION_REQUEST = 100
     }
+
+    private val isVideoMode: Boolean get() = videoPath != null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
-        SXLog.i(SXTags.LIFECYCLE, "onCreate")
 
-        renderer = GLRenderer(this)
-        cameraSource = PhoneCameraSource(this)
+        videoPath = intent.getStringExtra("video_path")
+        SXLog.i(SXTags.LIFECYCLE, "onCreate, videoMode=$isVideoMode, videoPath=$videoPath")
+
+        renderer = GLRenderer(this).apply {
+            mode = if (isVideoMode) GLRenderer.Mode.VIDEO else GLRenderer.Mode.AR
+            @Suppress("DEPRECATION")
+            displayRotation = windowManager.defaultDisplay.rotation
+        }
+
+        if (!isVideoMode) {
+            arSessionManager = ARSessionManager(this)
+        } else {
+            videoSource = VideoFileSource()
+        }
 
         glSurfaceView = findViewById<GLSurfaceView>(R.id.gl_surface).apply {
             preserveEGLContextOnPause = true
@@ -48,48 +59,46 @@ companion object {
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
 
-        // Set up HUD overlay
         overlayUI = OverlayUI(this).apply {
-            sourceLabel = "phone_camera"
+            sourceLabel = if (isVideoMode) "video_file" else "arcore"
             fpsProvider = { renderer.fps }
             frameTimeProvider = { renderer.lastFrameTimeMs }
+            if (!isVideoMode) {
+                trackingStateProvider = { renderer.trackingStateName }
+                planeCountProvider = { renderer.planeCount }
+            }
         }
         findViewById<FrameLayout>(R.id.root).addView(overlayUI)
 
-        // When GL surface is first created, request permission if needed
-        renderer.onSurfaceTextureAvailable = { surfaceTexture ->
-            runOnUiThread {
-                if (!hasCameraPermission()) {
-                    requestCameraPermission()
-                }
-            }
-        }
-
-        // Fires on every surface (re-)configuration — both fresh and preserved-context resume.
-        // This is the sole camera-start path to avoid races between onResume and the GL thread.
-        renderer.onSurfaceReady = { surfaceTexture ->
-            runOnUiThread {
-                if (hasCameraPermission() && !cameraSource.isRunning) {
-                    cameraSource.start(surfaceTexture)
-                    renderer.sensorRotation = cameraSource.sensorRotationDegrees
-                }
+        if (isVideoMode) {
+            renderer.onSurfaceTextureAvailable = { surfaceTexture ->
+                videoSource?.start(surfaceTexture, videoPath!!)
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
+        if (!isVideoMode) {
+            if (!hasCameraPermission()) {
+                requestCameraPermission()
+                return
+            }
+            setupAndResumeAR()
+        }
         glSurfaceView.onResume()
         overlayUI.startUpdating()
-        // Camera restart is handled by renderer.onSurfaceReady callback
-        // which fires once the GL thread resumes and re-configures the surface.
         SXLog.i(SXTags.LIFECYCLE, "onResume")
     }
 
     override fun onPause() {
         super.onPause()
         overlayUI.stopUpdating()
-        cameraSource.stop()
+        if (!isVideoMode) {
+            arSessionManager?.pause()
+        } else {
+            videoSource?.stop()
+        }
         glSurfaceView.onPause()
         SXLog.i(SXTags.LIFECYCLE, "onPause")
     }
@@ -97,20 +106,29 @@ companion object {
     override fun onDestroy() {
         super.onDestroy()
         glSurfaceView.queueEvent { renderer.release() }
+        arSessionManager?.destroy()
         SXLog.i(SXTags.LIFECYCLE, "onDestroy")
     }
 
+    private fun setupAndResumeAR() {
+        val manager = arSessionManager ?: return
+        if (!manager.tryCreateSession()) {
+            SXLog.w(SXTags.AR, "ARCore session not ready")
+            return
+        }
+        renderer.arSession = manager.session
+        manager.resume()
+    }
+
     override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == CAMERA_PERMISSION_REQUEST &&
             grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
         ) {
             SXLog.i(SXTags.CAM, "Camera permission granted")
-            renderer.surfaceTexture?.let { cameraSource.start(it) }
+            if (!isVideoMode) setupAndResumeAR()
         } else {
             SXLog.e(SXTags.CAM, "Camera permission denied")
         }

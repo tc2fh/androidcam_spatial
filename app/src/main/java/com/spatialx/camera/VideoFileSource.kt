@@ -5,20 +5,15 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.view.Surface
-import com.spatialx.core.CameraIntrinsics
-import com.spatialx.core.FramePacket
-import com.spatialx.core.ImageFormat
 import com.spatialx.util.SXLog
 import com.spatialx.util.SXTags
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Video file source using MediaExtractor + MediaCodec.
  *
- * Decodes a .mp4 file to a [SurfaceTexture] with native frame timing,
- * producing the same [FramePacket] output as [PhoneCameraSource] for
- * consistent downstream consumption. Supports looping for test replay.
+ * Decodes a .mp4 file to a [SurfaceTexture] with native frame timing.
+ * Supports looping for test replay.
  */
 class VideoFileSource {
 
@@ -26,9 +21,7 @@ class VideoFileSource {
     private var decoder: MediaCodec? = null
     private var decodeThread: Thread? = null
     private val running = AtomicBoolean(false)
-    private val frameIdCounter = AtomicLong(0)
 
-    var frameCallback: FrameSourceCallback? = null
     var loop = true
 
     @Volatile var isRunning = false; private set
@@ -122,16 +115,6 @@ class VideoFileSource {
                 }
 
                 codec.releaseOutputBuffer(outputIndex, true)
-
-                val packet = FramePacket(
-                    frameId = frameIdCounter.incrementAndGet(),
-                    timestampNs = ptsUs * 1000,
-                    width = videoWidth,
-                    height = videoHeight,
-                    format = ImageFormat.EXTERNAL_TEXTURE,
-                    intrinsics = CameraIntrinsics(0f, 0f, 0f, 0f, videoWidth, videoHeight)
-                )
-                frameCallback?.onFrame(packet)
             }
         }
 

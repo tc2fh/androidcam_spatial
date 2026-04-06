@@ -6,6 +6,12 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
+import com.google.ar.core.Coordinates2d
+import com.google.ar.core.Frame
+import com.google.ar.core.Plane
+import com.google.ar.core.Session
+import com.google.ar.core.TrackingState
+import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.spatialx.R
 import com.spatialx.util.SXLog
 import com.spatialx.util.SXTags
@@ -15,31 +21,44 @@ import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
-/**
- * Core OpenGL ES 3.0 renderer.
- *
- * Manages a [SurfaceTexture] that receives camera frames (from PhoneCameraSource
- * or VideoFileSource) and renders them as a fullscreen textured quad using
- * GL_TEXTURE_EXTERNAL_OES. Tracks frame timing for the debug HUD.
- */
 class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
-    // --- Camera texture ---
-    private var cameraTextureId = 0
+    enum class Mode { AR, VIDEO }
+
+    var mode: Mode = Mode.AR
+    var displayRotation: Int = 0
+
+    // --- AR mode ---
+    var arSession: Session? = null
+    private var hasSetTextureName = false
+    private lateinit var screenTexCoords: FloatBuffer
+    private lateinit var arTransformedTexCoords: FloatBuffer
+
+    // --- Video mode ---
     var surfaceTexture: SurfaceTexture? = null
         private set
     private val texMatrix = FloatArray(16)
-    private var frameAvailable = false
+    private var videoFrameAvailable = false
     private val frameLock = Object()
+    var onSurfaceTextureAvailable: ((SurfaceTexture) -> Unit)? = null
+    var sensorRotation: Int = 0
 
-    // --- Shader program ---
-    private var program = 0
-    private var uTexMatrixLoc = 0
-    private var uTextureLoc = 0
-
-    // --- Fullscreen quad geometry ---
+    // --- Camera background (shared) ---
+    private var cameraTextureId = 0
+    private var bgProgram = 0
+    private var bgTexMatrixLoc = 0
+    private var bgTextureLoc = 0
     private lateinit var quadVertices: FloatBuffer
     private lateinit var quadTexCoords: FloatBuffer
+    private val identityMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+
+    // --- Cube (AR mode) ---
+    private lateinit var cubeRenderer: CubeRenderer
+    private var cubeModelMatrix: FloatArray? = null
+    private val viewMatrix = FloatArray(16)
+    private val projMatrix = FloatArray(16)
+    private val vpMatrix = FloatArray(16)
+    private val mvpMatrix = FloatArray(16)
 
     // --- Timing ---
     @Volatile var lastFrameTimeMs: Long = 0L; private set
@@ -47,20 +66,13 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var frameCount = 0L
     private var fpsStartTimeNs = 0L
 
-    /** Called on the UI thread once the SurfaceTexture is ready for camera binding. */
-    var onSurfaceTextureAvailable: ((SurfaceTexture) -> Unit)? = null
-
-    /** Called each time the GL surface is (re-)configured — including preserved-context resumes. */
-    var onSurfaceReady: ((SurfaceTexture) -> Unit)? = null
-
-    // ---------------------------------------------------------------
-    // GLSurfaceView.Renderer
-    // ---------------------------------------------------------------
+    // --- Tracking state (for HUD) ---
+    @Volatile var trackingStateName: String = ""; private set
+    @Volatile var planeCount: Int = 0; private set
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES30.glClearColor(0f, 0f, 0f, 1f)
 
-        // Create external texture for camera
         val texIds = IntArray(1)
         GLES30.glGenTextures(1, texIds, 0)
         cameraTextureId = texIds[0]
@@ -70,139 +82,53 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
 
-        surfaceTexture = SurfaceTexture(cameraTextureId).also { st ->
-            st.setOnFrameAvailableListener {
-                synchronized(frameLock) { frameAvailable = true }
+        if (mode == Mode.VIDEO) {
+            surfaceTexture = SurfaceTexture(cameraTextureId).also { st ->
+                st.setOnFrameAvailableListener { synchronized(frameLock) { videoFrameAvailable = true } }
             }
         }
 
-        // Load and compile shaders
         val vertSrc = ShaderUtil.readRawResource(context, R.raw.camera_vert)
         val fragSrc = ShaderUtil.readRawResource(context, R.raw.camera_frag)
-        program = ShaderUtil.createProgram(vertSrc, fragSrc)
-        uTexMatrixLoc = GLES30.glGetUniformLocation(program, "uTexMatrix")
-        uTextureLoc = GLES30.glGetUniformLocation(program, "uTexture")
+        bgProgram = ShaderUtil.createProgram(vertSrc, fragSrc)
+        bgTexMatrixLoc = GLES30.glGetUniformLocation(bgProgram, "uTexMatrix")
+        bgTextureLoc = GLES30.glGetUniformLocation(bgProgram, "uTexture")
 
-        // Fullscreen quad: two triangles as a triangle strip
-        val vertices = floatArrayOf(
-            -1f, -1f, 0f,
-             1f, -1f, 0f,
-            -1f,  1f, 0f,
-             1f,  1f, 0f
-        )
-        val texCoords = floatArrayOf(
-            0f, 0f,
-            1f, 0f,
-            0f, 1f,
-            1f, 1f
-        )
-        quadVertices = ByteBuffer.allocateDirect(vertices.size * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer().put(vertices).also { it.position(0) }
-        quadTexCoords = ByteBuffer.allocateDirect(texCoords.size * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer().put(texCoords).also { it.position(0) }
+        val verts = floatArrayOf(-1f, -1f, 0f, 1f, -1f, 0f, -1f, 1f, 0f, 1f, 1f, 0f)
+        quadVertices = allocFloatBuffer(verts)
 
-        fpsStartTimeNs = System.nanoTime()
-        SXLog.i(SXTags.RENDER, "GL surface created, texture=$cameraTextureId")
+        val texCoords = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
+        quadTexCoords = allocFloatBuffer(texCoords)
 
-        onSurfaceTextureAvailable?.invoke(surfaceTexture!!)
-    }
-
-    /** Width/height of the camera feed — set before surface creation or updated on source change. */
-    var cameraWidth = 1920
-    var cameraHeight = 1080
-
-    /** Sensor orientation in degrees (0, 90, 180, 270). Set from PhoneCameraSource. */
-    var sensorRotation: Int = 0
-        set(value) {
-            field = value
-            // Recalculate aspect ratio now that rotation is known
-            if (lastSurfaceWidth > 0) updateQuadForAspect(lastSurfaceWidth, lastSurfaceHeight)
+        if (mode == Mode.AR) {
+            // VIEW_NORMALIZED coords for the four quad corners (matches quadTexCoords layout)
+            screenTexCoords = allocFloatBuffer(texCoords)
+            arTransformedTexCoords = ByteBuffer.allocateDirect(8 * 4)
+                .order(ByteOrder.nativeOrder()).asFloatBuffer()
         }
 
-    private var lastSurfaceWidth = 0
-    private var lastSurfaceHeight = 0
+        cubeRenderer = CubeRenderer(context)
+        cubeRenderer.init()
+
+        fpsStartTimeNs = System.nanoTime()
+        SXLog.i(SXTags.RENDER, "GL surface created, mode=$mode, texture=$cameraTextureId")
+
+        if (mode == Mode.VIDEO) {
+            onSurfaceTextureAvailable?.invoke(surfaceTexture!!)
+        }
+    }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES30.glViewport(0, 0, width, height)
-        lastSurfaceWidth = width
-        lastSurfaceHeight = height
-        updateQuadForAspect(width, height)
-        SXLog.i(SXTags.RENDER, "GL surface changed: ${width}x${height}")
-
-        // Always notify — covers both fresh context and preserved-context resume
-        surfaceTexture?.let { st -> onSurfaceReady?.invoke(st) }
-    }
-
-    /**
-     * Adjusts the fullscreen quad so the entire camera image is visible
-     * (fit / zoom-to-fit). Black bars appear on the shorter axis.
-     */
-    private fun updateQuadForAspect(surfaceWidth: Int, surfaceHeight: Int) {
-        val surfaceAspect = surfaceWidth.toFloat() / surfaceHeight
-        val cameraAspect = cameraWidth.toFloat() / cameraHeight
-
-        // Fit: show entire image, black bars on the axis with extra space
-        var sx = 1f
-        var sy = 1f
-        if (cameraAspect > surfaceAspect) {
-            // Camera wider than screen → fill width, reduce height
-            sy = surfaceAspect / cameraAspect
-        } else {
-            // Screen wider than camera → fill height, reduce width
-            sx = cameraAspect / surfaceAspect
+        if (mode == Mode.AR) {
+            arSession?.setDisplayGeometry(displayRotation, width, height)
         }
-
-        val vertices = floatArrayOf(
-            -sx, -sy, 0f,
-             sx, -sy, 0f,
-            -sx,  sy, 0f,
-             sx,  sy, 0f
-        )
-        quadVertices = ByteBuffer.allocateDirect(vertices.size * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer().put(vertices).also { it.position(0) }
+        SXLog.i(SXTags.RENDER, "GL surface changed: ${width}x${height}")
     }
 
     override fun onDrawFrame(gl: GL10?) {
         val frameStartNs = System.nanoTime()
-
-        // Update texture if a new frame is available
-        synchronized(frameLock) {
-            if (frameAvailable) {
-                surfaceTexture?.updateTexImage()
-                surfaceTexture?.getTransformMatrix(texMatrix)
-                // Apply sensor rotation around texture center (0.5, 0.5)
-                if (sensorRotation != 0) {
-                    Matrix.translateM(texMatrix, 0, 0.5f, 0.5f, 0f)
-                    Matrix.rotateM(texMatrix, 0, -sensorRotation.toFloat(), 0f, 0f, 1f)
-                    Matrix.translateM(texMatrix, 0, -0.5f, -0.5f, 0f)
-                }
-                frameAvailable = false
-            }
-        }
-
-        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
-
-        // Draw camera background
-        if (cameraTextureId != 0) {
-            GLES30.glUseProgram(program)
-
-            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-            GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
-            GLES30.glUniform1i(uTextureLoc, 0)
-            GLES30.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix, 0)
-
-            GLES30.glEnableVertexAttribArray(0)
-            GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 0, quadVertices)
-            GLES30.glEnableVertexAttribArray(1)
-            GLES30.glVertexAttribPointer(1, 2, GLES30.GL_FLOAT, false, 0, quadTexCoords)
-
-            GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
-
-            GLES30.glDisableVertexAttribArray(0)
-            GLES30.glDisableVertexAttribArray(1)
-        }
-
-        // Update timing
+        if (mode == Mode.AR) drawARFrame() else drawVideoFrame()
         frameCount++
         val now = System.nanoTime()
         lastFrameTimeMs = (now - frameStartNs) / 1_000_000L
@@ -214,23 +140,132 @@ class GLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Cleanup
-    // ---------------------------------------------------------------
+    private fun drawARFrame() {
+        val session = arSession ?: return
+        if (!hasSetTextureName) {
+            session.setCameraTextureName(cameraTextureId)
+            hasSetTextureName = true
+        }
+        val frame: Frame
+        try {
+            frame = session.update()
+        } catch (e: CameraNotAvailableException) {
+            SXLog.e(SXTags.AR, "Camera not available during update", e)
+            trackingStateName = "ERROR"
+            return
+        }
+        val camera = frame.camera
+        trackingStateName = camera.trackingState.name
 
-    /** Call from GL thread (e.g. via GLSurfaceView.queueEvent). */
+        // Transform screen-space UV coords to camera texture coords using current API
+        if (frame.hasDisplayGeometryChanged()) {
+            screenTexCoords.rewind()
+            arTransformedTexCoords.rewind()
+            frame.transformCoordinates2d(
+                Coordinates2d.VIEW_NORMALIZED,
+                screenTexCoords,
+                Coordinates2d.TEXTURE_NORMALIZED,
+                arTransformedTexCoords
+            )
+        }
+        arTransformedTexCoords.rewind()
+
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+        GLES30.glDisable(GLES30.GL_DEPTH_TEST)
+
+        // Draw camera background — AR mode uses identity texMatrix; coords are pre-transformed
+        GLES30.glUseProgram(bgProgram)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+        GLES30.glUniform1i(bgTextureLoc, 0)
+        GLES30.glUniformMatrix4fv(bgTexMatrixLoc, 1, false, identityMatrix, 0)
+
+        quadVertices.rewind()
+        GLES30.glEnableVertexAttribArray(0)
+        GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 0, quadVertices)
+        GLES30.glEnableVertexAttribArray(1)
+        GLES30.glVertexAttribPointer(1, 2, GLES30.GL_FLOAT, false, 0, arTransformedTexCoords)
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
+        GLES30.glDisableVertexAttribArray(0)
+        GLES30.glDisableVertexAttribArray(1)
+
+        if (camera.trackingState == TrackingState.TRACKING) {
+            GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+            camera.getViewMatrix(viewMatrix, 0)
+            camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100f)
+            if (cubeModelMatrix == null) placeCubeAhead(camera.displayOrientedPose)
+            Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
+            Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, cubeModelMatrix!!, 0)
+            cubeRenderer.draw(mvpMatrix)
+        }
+
+        planeCount = session.getAllTrackables(Plane::class.java)
+            .count { it.trackingState == TrackingState.TRACKING }
+    }
+
+    private fun placeCubeAhead(cameraPose: com.google.ar.core.Pose) {
+        val cameraMatrix = FloatArray(16)
+        cameraPose.toMatrix(cameraMatrix, 0)
+        // Column-major: column 2 (indices 8,9,10) is the camera's -Z forward in OpenGL convention
+        val forwardX = -cameraMatrix[8]
+        val forwardY = -cameraMatrix[9]
+        val forwardZ = -cameraMatrix[10]
+        val distance = 2f
+        val cx = cameraPose.tx() + forwardX * distance
+        val cy = cameraPose.ty() + forwardY * distance
+        val cz = cameraPose.tz() + forwardZ * distance
+        cubeModelMatrix = FloatArray(16).also {
+            Matrix.setIdentityM(it, 0)
+            Matrix.translateM(it, 0, cx, cy, cz)
+        }
+        SXLog.i(SXTags.RENDER, "Cube placed at (%.2f, %.2f, %.2f)".format(cx, cy, cz))
+    }
+
+    private fun drawVideoFrame() {
+        synchronized(frameLock) {
+            if (videoFrameAvailable) {
+                surfaceTexture?.updateTexImage()
+                surfaceTexture?.getTransformMatrix(texMatrix)
+                if (sensorRotation != 0) {
+                    Matrix.translateM(texMatrix, 0, 0.5f, 0.5f, 0f)
+                    Matrix.rotateM(texMatrix, 0, -sensorRotation.toFloat(), 0f, 0f, 1f)
+                    Matrix.translateM(texMatrix, 0, -0.5f, -0.5f, 0f)
+                }
+                videoFrameAvailable = false
+            }
+        }
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        if (cameraTextureId != 0) {
+            GLES30.glUseProgram(bgProgram)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId)
+            GLES30.glUniform1i(bgTextureLoc, 0)
+            GLES30.glUniformMatrix4fv(bgTexMatrixLoc, 1, false, texMatrix, 0)
+            quadVertices.rewind()
+            quadTexCoords.rewind()
+            GLES30.glEnableVertexAttribArray(0)
+            GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 0, quadVertices)
+            GLES30.glEnableVertexAttribArray(1)
+            GLES30.glVertexAttribPointer(1, 2, GLES30.GL_FLOAT, false, 0, quadTexCoords)
+            GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
+            GLES30.glDisableVertexAttribArray(0)
+            GLES30.glDisableVertexAttribArray(1)
+        }
+    }
+
+    private fun allocFloatBuffer(data: FloatArray): FloatBuffer =
+        ByteBuffer.allocateDirect(data.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .put(data)
+            .also { it.position(0) }
+
     fun release() {
         surfaceTexture?.release()
         surfaceTexture = null
-        if (program != 0) {
-            GLES30.glDeleteProgram(program)
-            program = 0
-        }
-        if (cameraTextureId != 0) {
-            val ids = intArrayOf(cameraTextureId)
-            GLES30.glDeleteTextures(1, ids, 0)
-            cameraTextureId = 0
-        }
+        cubeRenderer.release()
+        if (bgProgram != 0) { GLES30.glDeleteProgram(bgProgram); bgProgram = 0 }
+        if (cameraTextureId != 0) { GLES30.glDeleteTextures(1, intArrayOf(cameraTextureId), 0); cameraTextureId = 0 }
         SXLog.i(SXTags.RENDER, "GLRenderer released")
     }
 }
